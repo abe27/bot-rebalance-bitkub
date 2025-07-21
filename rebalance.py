@@ -11,24 +11,27 @@ from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.text import Text
+from dotenv import load_dotenv
 
 # การตั้งค่า
 API_HOST = 'https://api.bitkub.com'
-MIN_TRADE_AMOUNT = 40  # ขั้นต่ำการซื้อขาย 40 THB ตาม Bitkub
-FEE_RATE = 0.0025  # ค่าธรรมเนียมการซื้อขาย 0.25%
-BANK = 'KBank'  # ธนาคาร: 'KBank' หรือ 'Other'
+MIN_TRADE_AMOUNT = 40
+FEE_RATE = 0.0025
+BANK = 'KBank'
 THRESHOLD = 0.05
-INITIAL_THB = 1000.0  # เงินทุนเริ่มต้นสำหรับการคำนวณ Buy-and-Hold
 
-# สร้าง Console สำหรับ Rich
 console = Console()
 
-# การตั้งค่า Bitkub API จาก environment variables
-API_KEY = os.environ.get('BITKUB_API_KEY')
-API_SECRET = os.environ.get('BITKUB_API_SECRET')
-if not API_KEY or not API_SECRET:
-    raise Exception("Error: BITKUB_API_KEY or BITKUB_API_SECRET not set in environment variables")
+# --- Core Functions ---
+
+def get_api_credentials():
+    """ดึง API Key และ Secret จาก environment variables"""
+    load_dotenv()
+    api_key = os.environ.get('BITKUB_API_KEY')
+    api_secret = os.environ.get('BITKUB_API_SECRET')
+    if not api_key or not api_secret:
+        raise Exception("Error: BITKUB_API_KEY or BITKUB_API_SECRET not set in environment variables")
+    return api_key, api_secret
 
 def gen_sign(api_secret, payload):
     """สร้าง signature สำหรับ secure endpoints"""
@@ -39,317 +42,312 @@ def format_number(number, decimals=2):
     return f"{number:,.{decimals}f}"
 
 def log_transaction(timestamp, currency, action, amount, price, fee, portfolio_value):
-    """บันทึกธุรกรรมลง CSV"""
+    """บันทึกธุรกรรมลง trade_log.csv"""
+    # Create file and write header if it doesn't exist
+    if not os.path.exists('trade_log.csv'):
+        with open('trade_log.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'Currency', 'Action', 'Amount', 'Price', 'Fee', 'Portfolio_Value'])
+    
     with open('trade_log.csv', 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([timestamp, currency, action, amount, price, fee, portfolio_value])
 
 def calculate_withdrawal_fee(amount, bank):
     """คำนวณค่าธรรมเนียมการถอน"""
-    if bank == 'KBank':
-        return 20.0
-    else:  # Other banks
-        if amount <= 100000:
-            return 20.0
-        elif amount <= 500000:
-            return 75.0
-        elif amount <= 2000000:
-            return 200.0
-        else:
-            return None  # ไม่สามารถถอนได้
+    if bank == 'KBank': return 20.0
+    else:
+        if amount <= 100000: return 20.0
+        elif amount <= 500000: return 75.0
+        elif amount <= 2000000: return 200.0
+        else: return None
 
 def load_config():
-    """โหลดสัดส่วนเป้าหมายจาก environment variable TARGET_ALLOCATIONS"""
+    """โหลดสัดส่วนเป้าหมายจาก config.json"""
     try:
-        target_allocations_str = os.environ.get('TARGET_ALLOCATIONS')
-        if not target_allocations_str:
-            raise Exception("Error: TARGET_ALLOCATIONS not set in environment variables")
-        target_allocations = json.loads(target_allocations_str)
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+        target_allocations = config.get('target_allocations', {})
         if not target_allocations:
-            raise Exception("Error: No target allocations found in TARGET_ALLOCATIONS")
+            raise Exception("Error: 'target_allocations' not found in config.json")
         if abs(sum(target_allocations.values()) - 1.0) > 0.01:
-            raise Exception("Error: Sum of target allocations must be 100%")
+            raise Exception("Error: Sum of target allocations must be 1.0 (100%)")
+        if 'THB' not in target_allocations:
+            raise Exception("Error: 'THB' must be in 'target_allocations'")
+        
         coins = [coin for coin in target_allocations.keys() if coin != 'THB']
         pairs = [f'THB_{coin}' for coin in coins]
-        if not all(coin in target_allocations for coin in ['THB'] + coins):
-            raise Exception("Error: All coins and THB must have target allocations")
         return pairs, target_allocations
+    except FileNotFoundError:
+        raise Exception("Error: 'config.json' not found. Please create it from 'config.json.example'.")
     except json.JSONDecodeError:
-        raise Exception("Error: TARGET_ALLOCATIONS must be a valid JSON string")
-    except Exception as e:
-        raise Exception(f"Error loading target allocations: {e}")
+        raise Exception("Error: Could not decode 'config.json'. Please ensure it is valid JSON.")
 
-def initialize_portfolio(coins):
-    """สร้างพอร์ตเริ่มต้นจากยอดคงเหลือจริงใน Bitkub"""
+# --- Bitkub API Interaction ---
+
+def make_request(api_secret, endpoint, method='POST', body=None):
+    """ฟังก์ชันกลางสำหรับสร้างและส่ง request ไปยัง Bitkub API"""
+    API_KEY, _ = get_api_credentials()
+    ts = str(int(time.time() * 1000))
+    
+    body_str = json.dumps(body) if body else ''
+    payload = f"{ts}{method.upper()}{endpoint}{body_str}"
+    sig = gen_sign(api_secret, payload)
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'X-BTK-TIMESTAMP': ts,
+        'X-BTK-SIGN': sig,
+        'X-BTK-APIKEY': API_KEY
+    }
+    try:
+        response = requests.request(method, f'{API_HOST}{endpoint}', headers=headers, data=body_str)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('error') != 0:
+            raise Exception(f"API Error {data.get('error')}: {data.get('message', 'Unknown error')}")
+        return data
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Request failed: {e}")
+
+def get_balances(api_secret, coins):
+    """ดึงยอดคงเหลือจาก Bitkub"""
     portfolio = {'THB': 0.0}
     for coin in coins:
         portfolio[coin] = 0.0
-    try:
-        ts = str(int(time.time() * 1000))  # Timestamp in milliseconds
-        payload = f"{ts}POST/api/v3/market/balances"
-        sig = gen_sign(API_SECRET, payload)
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'X-BTK-TIMESTAMP': ts,
-            'X-BTK-SIGN': sig,
-            'X-BTK-APIKEY': API_KEY
-        }
-        response = requests.post(f'{API_HOST}/api/v3/market/balances', headers=headers, json={})
-        data = response.json()
-        if data.get('error') != 0:
-            raise Exception(f"Error fetching balance: {data.get('error')}")
-        balances = data['result']
-        portfolio['THB'] = balances['THB']['available'] if 'THB' in balances else 0.0
-        for coin in coins:
-            portfolio[coin] = balances[coin]['available'] if coin in balances else 0.0
-        return portfolio
-    except Exception as e:
-        raise Exception(f"Error fetching balance: {e}")
+    
+    data = make_request(api_secret, '/api/v3/market/balances')
+    balances = data.get('result', {})
+    portfolio['THB'] = balances.get('THB', {}).get('available', 0.0)
+    for coin in coins:
+        portfolio[coin] = balances.get(coin, {}).get('available', 0.0)
+    return portfolio
 
 def fetch_current_prices(pairs):
-    """ดึงราคาเหรียญแบบเรียลไทม์จาก Bitkub"""
+    """ดึงราคาล่าสุดจาก Bitkub. API format is COIN_THB."""
     prices = {}
     try:
         response = requests.get(f'{API_HOST}/api/v3/market/ticker')
-        data = response.json()
-        if data.get('error') != 0:
-            raise Exception(f"Error fetching ticker: {data.get('error')}")
-        for pair in pairs:
-            symbol = pair  # Bitkub API ใช้ THB_BTC
-            if symbol in data:
-                prices[pair] = data[symbol]['last']
+        response.raise_for_status()
+        # The API returns a list of dicts. Convert it to a dict keyed by symbol for efficient lookup.
+        api_data = {item['symbol']: item for item in response.json()}
+
+        for pair in pairs: # pair is in THB_COIN format, e.g., 'THB_XRP'
+            # Convert internal format to API format for lookup
+            coin = pair.split('_')[1]
+            ticker_symbol = f"{coin}_THB" # e.g., 'XRP_THB'
+            
+            if ticker_symbol in api_data:
+                prices[pair] = float(api_data[ticker_symbol]['last'])
             else:
-                console.print(f"[red]❗ Price for {pair} not found[/red]")
+                console.print(f"[yellow]Warning: Price for {pair} (lookup as {ticker_symbol}) not found in API response.[/yellow]")
                 prices[pair] = 0
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         console.print(f"[red]❗ Error fetching prices: {e}[/red]")
         for pair in pairs:
             prices[pair] = 0
     return prices
 
-def place_order(symbol, action, amount):
-    """ส่งคำสั่งซื้อ/ขายแบบ market order"""
-    try:
-        ts = str(int(time.time() * 1000))
-        endpoint = '/api/v3/market/place-bid' if action == 'buy' else '/api/v3/market/place-ask'
-        req_body = {'sym': symbol, 'amt': amount, 'typ': 'market'}
-        payload = f"{ts}POST{endpoint}{json.dumps(req_body)}"
-        sig = gen_sign(API_SECRET, payload)
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'X-BTK-TIMESTAMP': ts,
-            'X-BTK-SIGN': sig,
-            'X-BTK-APIKEY': API_KEY
-        }
-        response = requests.post(f'{API_HOST}{endpoint}', headers=headers, json=req_body)
-        data = response.json()
-        if data.get('error') != 0:
-            raise Exception(f"Error placing {action} order for {symbol}: {data.get('error')}")
-        return data['result']
-    except Exception as e:
-        raise Exception(f"Error placing order: {e}")
+def place_order(api_secret, symbol, action, amount):
+    """ส่งคำสั่งซื้อ/ขาย (Market Order). Symbol must be in COIN_THB format. Amount must be a float.
+    The amount will be formatted to string with no trailing zeros before sending to API.
+    """
+    endpoint = '/api/v3/market/place-bid' if action == 'buy' else '/api/v3/market/place-ask'
+
+    # Format amount to string with no trailing zeros
+    req_body = {'sym': symbol, 'amt': round(amount, 2), 'rat': 0,'typ': 'market'}
+    data = make_request(api_secret, endpoint, method='POST', body=req_body)
+    return data.get('result', {})
+
+# --- Portfolio & Display ---
 
 def calculate_portfolio_value(portfolio, prices):
-    """คำนวณมูลค่าพอร์ต"""
-    total_value = portfolio['THB']
-    for pair, price in prices.items():
-        if pair.startswith('THB_') and pd.notna(price):
-            currency = pair.split('_')[1]
-            total_value += portfolio[currency] * price
+    """คำนวณมูลค่าพอร์ตรวม"""
+    total_value = portfolio.get('THB', 0.0)
+    for currency, amount in portfolio.items():
+        if currency != 'THB':
+            price = prices.get(f'THB_{currency}', 0) # CORRECT: Use internal format
+            total_value += amount * price
     return total_value
 
-def display_portfolio(timestamp, total_value, current_allocations, portfolio, prices, transactions):
-    """แสดงข้อมูลพอร์ตและธุรกรรมในรูปแบบตาราง"""
+def display_portfolio(timestamp, total_value, current_allocations, portfolio, prices, target_allocations):
+    """แสดงข้อมูลพอร์ตในรูปแบบตาราง"""
     portfolio_table = Table(title=f"📅 Portfolio at {timestamp}", show_header=True, header_style="bold cyan")
     portfolio_table.add_column("Asset", style="magenta", width=10)
     portfolio_table.add_column("Amount", style="yellow", width=15)
     portfolio_table.add_column("Price (THB)", style="cyan", width=15)
-    portfolio_table.add_column("Buy", style="green", width=15)
-    portfolio_table.add_column("Sell", style="red", width=15)
+    portfolio_table.add_column("Value (THB)", style="green", width=15)
     portfolio_table.add_column("Allocation", style="green", width=12)
     portfolio_table.add_column("Target", style="yellow", width=12)
-    for asset, allocation in current_allocations.items():
-        target = TARGET_ALLOCATIONS[asset]
+
+    for asset, target in target_allocations.items():
+        amount = portfolio.get(asset, 0.0)
+        price = prices.get(f'THB_{asset}') if asset != 'THB' else 1 # CORRECT: Use internal format
+        value = amount * price if price is not None else 0
+        allocation = current_allocations.get(asset, 0.0)
+
         allocation_text = f"{allocation:.2%}"
         if abs(allocation - target) > THRESHOLD:
-            allocation_text = f"[red]{allocation_text}[/red]"
-        amount = portfolio[asset] if asset != 'THB' else 0
-        price = prices.get(f'THB_{asset}', 0) if asset != 'THB' else None
-        price_text = f"{format_number(price, 2)}" if price is not None and pd.notna(price) else "-"
-        buy_amount = sum(t['amount'] for t in transactions if t['currency'] == asset and t['action'] == 'Buy')
-        sell_amount = sum(t['amount'] for t in transactions if t['currency'] == asset and t['action'] == 'Sell')
-        buy_text = f"{format_number(buy_amount, 6)}" if buy_amount > 0 else "-"
-        sell_text = f"{format_number(sell_amount, 6)}" if sell_amount > 0 else "-"
+            allocation_text = f"[bold red]{allocation_text}[/bold red]"
+        
+        price_text = f"{format_number(price, 2)}" if price is not None and asset != 'THB' else "1.00"
+
         portfolio_table.add_row(
             asset,
-            f"{format_number(amount, 6)}" if asset != 'THB' else "-",
+            f"{format_number(amount, 6)}",
             price_text,
-            buy_text,
-            sell_text,
+            f"{format_number(value, 2)}",
             allocation_text,
             f"{target:.2%}"
         )
     
-    console.print(Panel(portfolio_table, title=f"💰 Portfolio Value: {format_number(total_value)} THB", border_style="blue"))
-    
-    if transactions:
-        transaction_table = Table(title="📈 Transactions", show_header=True, header_style="bold cyan")
-        transaction_table.add_column("Action", style="magenta")
-        transaction_table.add_column("Currency", style="yellow")
-        transaction_table.add_column("Amount", style="green")
-        transaction_table.add_column("Price (THB)", style="green")
-        transaction_table.add_column("Fee (THB)", style="red")
-        transaction_table.add_column("Remaining", style="cyan")
-        for t in transactions:
-            action_style = "green" if t['action'] == 'Buy' else "red"
-            transaction_table.add_row(
-                f"[{action_style}]{t['action']}[/{action_style}]",
-                t['currency'],
-                f"{format_number(t['amount'], 6)}",
-                f"{format_number(t['price'], 2)}",
-                f"{format_number(t['fee'], 2)}",
-                f"{format_number(t['remaining'], 6)}"
-            )
-        console.print(transaction_table)
+    console.print(Panel(portfolio_table, title=f"💰 Current Portfolio Value: {format_number(total_value)} THB", border_style="blue"))
+
+def display_transactions(transactions):
+    """แสดงข้อมูลธุรกรรมในรูปแบบตาราง"""
+    if not transactions: return
+
+    transaction_table = Table(title="📈 Transactions Executed", show_header=True, header_style="bold cyan")
+    transaction_table.add_column("Action", style="magenta")
+    transaction_table.add_column("Currency", style="yellow")
+    transaction_table.add_column("Amount", style="green")
+    transaction_table.add_column("Value (THB)", style="green")
+    transaction_table.add_column("Fee (THB)", style="red")
+
+    for t in transactions:
+        action_style = "green" if t['action'] == 'Buy' else "red"
+        transaction_table.add_row(
+            f"[{action_style}]{t['action']}[/{action_style}]",
+            t['currency'],
+            f"{format_number(t['amount'], 6)}",
+            f"{format_number(t['value'], 2)}",
+            f"{format_number(t['fee'], 4)}"
+        )
+    console.print(transaction_table)
+
+# --- Main Rebalance Logic ---
 
 def rebalance():
     """ฟังก์ชัน Rebalance ซื้อ/ขายจริง"""
-    global TARGET_ALLOCATIONS
-    console.print(Panel("🚀 Starting Rebalance", style="bold green"))
+    console.print(Panel("🚀 Starting Rebalance Bot", style="bold green"))
     
-    with open('trade_log.csv', 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Timestamp', 'Currency', 'Action', 'Amount', 'Price', 'Fee', 'Portfolio_Value'])
-    
+    _, api_secret = get_api_credentials()
     PAIRS, TARGET_ALLOCATIONS = load_config()
-    coins = [pair.split('_')[1] for pair in PAIRS]
-    portfolio = initialize_portfolio(coins)
-    buy_hold_portfolio = initialize_portfolio(coins)
-    total_fees = 0.0
-
-    # ดึงราคาเริ่มต้นสำหรับ Buy-and-Hold
+    coins = [p.split('_')[1] for p in PAIRS]
+    
+    # 1. Get Initial State
+    console.print("Fetching initial portfolio state...")
+    portfolio = get_balances(api_secret, coins + ['THB'])
     initial_prices = fetch_current_prices(PAIRS)
+    if not initial_prices or all(v == 0 for v in initial_prices.values()):
+        raise Exception("Could not fetch any valid prices from API. Aborting.")
     initial_value = calculate_portfolio_value(portfolio, initial_prices)
-    
-    # คำนวณ Buy-and-Hold (สมมติซื้อครั้งแรกตามสัดส่วนเป้าหมาย)
-    for currency, target in TARGET_ALLOCATIONS.items():
-        if currency != 'THB' and f'THB_{currency}' in initial_prices:
-            amount = (target * INITIAL_THB) / initial_prices[f'THB_{currency}']
-            buy_hold_portfolio[currency] = amount
-            buy_hold_portfolio['THB'] -= amount * initial_prices[f'THB_{currency}']
-    
-    # เริ่ม Rebalance
+    console.print(f"[green]Initial portfolio value: {format_number(initial_value)} THB[/green]")
+
+    # 2. Setup Buy-and-Hold for comparison
+    buy_hold_portfolio = portfolio.copy()
+
+    # 3. Start Rebalance Check
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     prices = fetch_current_prices(PAIRS)
-    transactions = []
-    
+    if not prices or all(v == 0 for v in prices.values()):
+        raise Exception("Could not fetch current prices for rebalancing. Aborting.")
+
     total_value = calculate_portfolio_value(portfolio, prices)
-    current_allocations = {'THB': portfolio['THB'] / total_value if total_value > 0 else 0}
-    for pair in PAIRS:
-        currency = pair.split('_')[1]
-        current_allocations[currency] = (portfolio[currency] * prices.get(pair, 0)) / total_value if pair in prices and total_value > 0 else 0
-    
+    current_allocations = {c: (portfolio.get(c, 0) * prices.get(f'THB_{c}', 0)) / total_value if total_value > 0 else 0 for c in TARGET_ALLOCATIONS}
+    current_allocations['THB'] = portfolio['THB'] / total_value if total_value > 0 else 0
+
+    display_portfolio(timestamp, total_value, current_allocations, portfolio, prices, TARGET_ALLOCATIONS)
+
+    transactions = []
+    # 4. Execute Trades if needed
     for currency, target in TARGET_ALLOCATIONS.items():
-        current = current_allocations[currency]
-        if abs(current - target) > THRESHOLD:
+        if currency == 'THB': continue
+
+        current_alloc = current_allocations.get(currency, 0.0)
+        if abs(current_alloc - target) > THRESHOLD:
+            internal_pair = f'THB_{currency}' # Internal format for price lookup
+            api_symbol = f'{currency}_THB'.lower()   # API format for placing orders, must be lowercase
+
+            price = prices.get(internal_pair, 0)
+            if price == 0: 
+                console.print(f"[yellow]Skipping {currency} due to missing price.[/yellow]")
+                continue
+
+            current_value = portfolio[currency] * price
             target_value = total_value * target
-            current_value = portfolio[currency] * prices[f'THB_{currency}'] if currency != 'THB' and f'THB_{currency}' in prices else portfolio['THB']
             diff_value = target_value - current_value
             
-            if currency != 'THB' and f'THB_{currency}' in prices:
-                pair = f'THB_{currency}'
-                price = prices[pair]
-                amount = abs(diff_value) / price
-                trade_value = amount * price
-                fee = math.ceil((trade_value * FEE_RATE) * 100) / 100
+            action = 'buy' if diff_value > 0 else 'sell'
+
+            try:
+                if action == 'buy':
+                    amount_in_thb = diff_value
+                    if amount_in_thb < MIN_TRADE_AMOUNT: continue
+                    # Format amount to 2 decimal places for THB
+                    formatted_amount = round(amount_in_thb, 2)
+                    console.print(f"Attempting to [green]BUY[/green] {formatted_amount} THB of {currency} using symbol {api_symbol}")
+                    order = place_order(api_secret, api_symbol, 'buy', formatted_amount)
+                    actual_amount_crypto = order.get('amt', 0)
+                    actual_fee = order.get('fee', 0)
+                    log_transaction(timestamp, currency, 'Buy', actual_amount_crypto, price, actual_fee, total_value)
+                    transactions.append({'action': 'Buy', 'currency': currency, 'amount': actual_amount_crypto, 'value': formatted_amount, 'fee': actual_fee})
                 
-                if trade_value >= MIN_TRADE_AMOUNT:
-                    action = 'buy' if diff_value > 0 else 'sell'
-                    action_str = 'Buy' if action == 'buy' else 'Sell'
-                    
-                    try:
-                        # ตรวจสอบยอดคงเหลือ
-                        if action == 'buy' and portfolio['THB'] < trade_value + fee:
-                            console.print(f"[red]❗ Insufficient THB balance for {action_str} {currency}: {portfolio['THB']} < {trade_value + fee}[/red]")
-                            continue
-                        if action == 'sell' and portfolio[currency] < amount:
-                            console.print(f"[red]❗ Insufficient {currency} balance: {portfolio[currency]} < {amount}[/red]")
-                            continue
-                        
-                        # ส่งคำสั่งซื้อ/ขาย
-                        order = place_order(pair, action, amount)
-                        actual_amount = order.get('amt', amount)
-                        actual_price = order.get('rat', price) or price
-                        actual_fee = order.get('fee', fee) or fee
-                        remaining = portfolio[currency]
-                        if action == 'buy':
-                            portfolio[currency] += actual_amount
-                            portfolio['THB'] -= actual_amount * actual_price + actual_fee
-                            remaining += actual_amount
-                        else:
-                            portfolio[currency] -= actual_amount
-                            portfolio['THB'] += actual_amount * actual_price - actual_fee
-                            remaining -= actual_amount
-                        total_fees += actual_fee
-                        
-                        log_transaction(timestamp, currency, action_str, actual_amount, actual_price, actual_fee, total_value)
-                        transactions.append({
-                            'action': action_str,
-                            'currency': currency,
-                            'amount': actual_amount,
-                            'price': actual_price,
-                            'fee': actual_fee,
-                            'remaining': remaining
-                        })
-                    except Exception as e:
-                        console.print(f"[red]❗ Error executing {action_str} order for {currency}: {e}[/red]")
-    
-    display_portfolio(timestamp, total_value, current_allocations, portfolio, prices, transactions)
-    
-    # คำนวณผลลัพธ์
+                else: # Sell
+                    amount_to_sell_crypto = abs(diff_value) / price
+                    value_in_thb = amount_to_sell_crypto * price
+                    if value_in_thb < MIN_TRADE_AMOUNT: continue
+                    # Format amount to 8 decimal places for crypto
+                    formatted_amount = round(amount_to_sell_crypto, 8)
+                    console.print(f"Attempting to [red]SELL[/red] {formatted_amount} {currency} using symbol {api_symbol}")
+                    order = place_order(api_secret, api_symbol, 'sell', formatted_amount)
+                    actual_fee = order.get('fee', 0)
+                    log_transaction(timestamp, currency, 'Sell', formatted_amount, price, actual_fee, total_value)
+                    transactions.append({'action': 'Sell', 'currency': currency, 'amount': formatted_amount, 'value': value_in_thb, 'fee': actual_fee})
+
+            except Exception as e:
+                console.print(f"[red]❗ Error executing {action} order for {currency}: {e}[/red]")
+
+    # 5. Display Results
+    display_transactions(transactions)
+
+    console.print("\nFetching final portfolio state...")
+    final_portfolio = get_balances(api_secret, coins + ['THB'])
     final_prices = fetch_current_prices(PAIRS)
-    final_value = calculate_portfolio_value(portfolio, final_prices)
+    final_value = calculate_portfolio_value(final_portfolio, final_prices)
     buy_hold_final = calculate_portfolio_value(buy_hold_portfolio, final_prices)
-    withdrawal_fee = calculate_withdrawal_fee(portfolio['THB'], BANK)
-    if withdrawal_fee is None:
-        withdrawal_fee = 0
-        console.print(f"[red]❗ Warning: Cannot withdraw {format_number(portfolio['THB'])} THB with {BANK}[/red]")
     
+    total_fees = sum(t['fee'] for t in transactions)
+    withdrawal_fee = calculate_withdrawal_fee(final_portfolio.get('THB', 0), BANK) or 0
+
     net_value = final_value - withdrawal_fee
     profit = net_value - initial_value
     roi = (profit / initial_value) * 100 if initial_value > 0 else 0
-    buy_hold_profit = buy_hold_final - INITIAL_THB
-    buy_hold_roi = (buy_hold_profit / INITIAL_THB) * 100 if INITIAL_THB > 0 else 0
-    
-    # แสดงสรุปผล
+    buy_hold_profit = buy_hold_final - initial_value
+    buy_hold_roi = (buy_hold_profit / initial_value) * 100 if initial_value > 0 else 0
+
     summary_table = Table(title="📊 Rebalance Summary", show_header=True, header_style="bold cyan")
     summary_table.add_column("Metric", style="magenta")
     summary_table.add_column("Value", style="green")
     summary_table.add_row("Date", f"{timestamp}")
     summary_table.add_row("Initial Value", f"{format_number(initial_value)} THB")
     summary_table.add_row("Rebalance Final Value", f"{format_number(final_value)} THB")
-    summary_table.add_row("Total Trading Fees", f"{format_number(total_fees)} THB")
+    summary_table.add_row("Total Trading Fees", f"{format_number(total_fees, 4)} THB")
     summary_table.add_row("Withdrawal Fee", f"{format_number(withdrawal_fee)} THB")
     summary_table.add_row("Rebalance Net Value", f"{format_number(net_value)} THB")
-    summary_table.add_row("Rebalance Profit", f"[{'green' if profit >= 0 else 'red'}]{format_number(profit)} THB[/{'green' if profit >= 0 else 'red'}]")
-    summary_table.add_row("Rebalance ROI", f"[{'green' if roi >= 0 else 'red'}]{format_number(roi, 2)}%[/{'green' if roi >= 0 else 'red'}]")
-    summary_table.add_row("Buy-and-Hold Value", f"{format_number(buy_hold_final)} THB")
-    summary_table.add_row("Buy-and-Hold Profit", f"[{'green' if buy_hold_profit >= 0 else 'red'}]{format_number(buy_hold_profit)} THB[/{'green' if buy_hold_profit >= 0 else 'red'}]")
-    summary_table.add_row("Buy-and-Hold ROI", f"[{'green' if buy_hold_roi >= 0 else 'red'}]{format_number(buy_hold_roi, 2)}%[/{'green' if buy_hold_roi >= 0 else 'red'}]")
+    summary_table.add_row("Rebalance Profit", f"[{ 'green' if profit >= 0 else 'red'}]{format_number(profit)} THB[/{ 'green' if profit >= 0 else 'red'}]")
+    summary_table.add_row("Rebalance ROI", f"[{ 'green' if roi >= 0 else 'red'}]{format_number(roi, 2)}%[/{ 'green' if roi >= 0 else 'red'}]")
+    summary_table.add_row("Buy-and-Hold Final Value", f"{format_number(buy_hold_final)} THB")
+    summary_table.add_row("Buy-and-Hold Profit", f"[{ 'green' if buy_hold_profit >= 0 else 'red'}]{format_number(buy_hold_profit)} THB[/{ 'green' if buy_hold_profit >= 0 else 'red'}]")
+    summary_table.add_row("Buy-and-Hold ROI", f"[{ 'green' if buy_hold_roi >= 0 else 'red'}]{format_number(buy_hold_roi, 2)}%[/{ 'green' if buy_hold_roi >= 0 else 'red'}]")
     
     console.print(Panel(summary_table, title="✅ Rebalance Complete", border_style="green"))
 
 def main():
     try:
-        global INITIAL_PORTFOLIO
-        PAIRS, TARGET_ALLOCATIONS = load_config()
-        coins = [pair.split('_')[1] for pair in PAIRS]
-        INITIAL_PORTFOLIO = initialize_portfolio(coins)
         rebalance()
     except Exception as e:
-        console.print(f"[red]❗ Rebalance Error: {e}[/red]")
+        console.print(f"[bold red]❗ An error occurred: {e}[/bold red]")
 
 if __name__ == "__main__":
     main()
