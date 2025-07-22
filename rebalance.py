@@ -1,6 +1,4 @@
-import pandas as pd
 import csv
-import math
 import json
 import os
 import requests
@@ -14,67 +12,78 @@ from rich.panel import Panel
 from dotenv import load_dotenv
 
 # การตั้งค่า
-API_HOST = 'https://api.bitkub.com'
-MIN_TRADE_AMOUNT = 40
-FEE_RATE = 0.0025
-BANK = 'KBank'
-THRESHOLD = 0.05
+API_HOST = 'https://api.bitkub.com'  # URL ของ Bitkub API
+MIN_TRADE_AMOUNT = 50  # จำนวนเงินขั้นต่ำสำหรับการซื้อขาย (บาท)
+FEE_RATE = 0.0025  # อัตราค่าธรรมเนียมการซื้อขาย (0.25%)
+BANK = 'KBank'  # ธนาคารที่ใช้สำหรับการถอนเงิน
+THRESHOLD = 0.05  # ค่าเกณฑ์สำหรับการปรับสมดุลพอร์ต (5%)
 
-console = Console()
+console = Console()  # สร้างอ็อบเจ็กต์สำหรับแสดงผลในรูปแบบตารางและสีสัน
 
 # --- Core Functions ---
 
 def get_api_credentials():
     """ดึง API Key และ Secret จาก environment variables"""
+    # โหลดตัวแปรจากไฟล์ .env
     load_dotenv()
     api_key = os.environ.get('BITKUB_API_KEY')
     api_secret = os.environ.get('BITKUB_API_SECRET')
+    # ตรวจสอบว่า API Key และ Secret มีอยู่หรือไม่
     if not api_key or not api_secret:
         raise Exception("Error: BITKUB_API_KEY or BITKUB_API_SECRET not set in environment variables")
     return api_key, api_secret
 
 def gen_sign(api_secret, payload):
-    """สร้าง signature สำหรับ secure endpoints"""
+    """สร้าง signature สำหรับการเรียก API แบบ secure"""
+    # ใช้ HMAC-SHA256 เพื่อสร้าง signature จาก payload และ secret key
     return hmac.new(api_secret.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
 
 def format_number(number, decimals=2):
-    """เพิ่ม comma ในตัวเลขและควบคุมทศนิยม"""
+    """จัดรูปแบบตัวเลขโดยเพิ่มเครื่องหมายคอมมาและควบคุมจำนวนทศนิยม"""
     return f"{number:,.{decimals}f}"
 
 def log_transaction(timestamp, currency, action, amount, price, fee, portfolio_value):
-    """บันทึกธุรกรรมลง trade_log.csv"""
-    # Create file and write header if it doesn't exist
+    """บันทึกข้อมูลธุรกรรมลงไฟล์ trade_log.csv"""
+    # สร้างไฟล์และเขียนส่วนหัวถ้ายังไม่มีไฟล์
     if not os.path.exists('trade_log.csv'):
         with open('trade_log.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Timestamp', 'Currency', 'Action', 'Amount', 'Price', 'Fee', 'Portfolio_Value'])
     
+    # เพิ่มข้อมูลธุรกรรมลงไฟล์
     with open('trade_log.csv', 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([timestamp, currency, action, amount, price, fee, portfolio_value])
 
 def calculate_withdrawal_fee(amount, bank):
-    """คำนวณค่าธรรมเนียมการถอน"""
-    if bank == 'KBank': return 20.0
+    """คำนวณค่าธรรมเนียมการถอนเงินตามจำนวนและธนาคาร"""
+    if bank == 'KBank':
+        return 20.0  # ค่าธรรมเนียมถอนสำหรับ KBank
     else:
+        # ค่าธรรมเนียมถอนสำหรับธนาคารอื่นตามยอดเงิน
         if amount <= 100000: return 20.0
         elif amount <= 500000: return 75.0
         elif amount <= 2000000: return 200.0
         else: return None
 
 def load_config():
-    """โหลดสัดส่วนเป้าหมายจาก config.json"""
+    """โหลดสัดส่วนเป้าหมายจากไฟล์ config.json"""
     try:
+        # อ่านไฟล์ config.json
         with open('config.json', 'r') as f:
             config = json.load(f)
         target_allocations = config.get('target_allocations', {})
+        # ตรวจสอบว่า target_allocations มีข้อมูลหรือไม่
         if not target_allocations:
             raise Exception("Error: 'target_allocations' not found in config.json")
+        # ตรวจสอบว่ารวมสัดส่วนเท่ากับ 100% หรือไม่
         if abs(sum(target_allocations.values()) - 1.0) > 0.01:
             raise Exception("Error: Sum of target allocations must be 1.0 (100%)")
+        # ตรวจสอบว่ามี THB ใน target_allocations หรือไม่
         if 'THB' not in target_allocations:
             raise Exception("Error: 'THB' must be in 'target_allocations'")
         
+        # สร้างรายการคู่เหรียญ (เช่น THB_BTC) และคืนค่า
         coins = [coin for coin in target_allocations.keys() if coin != 'THB']
         pairs = [f'THB_{coin}' for coin in coins]
         return pairs, target_allocations
@@ -85,11 +94,22 @@ def load_config():
 
 # --- Bitkub API Interaction ---
 
+def check_api_status():
+    """ตรวจสอบสถานะของ Bitkub API"""
+    try:
+        response = requests.get(f'{API_HOST}/api/status')
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]❗ Error checking API status: {e}[/red]")
+        return None
+
 def make_request(api_secret, endpoint, method='POST', body=None):
-    """ฟังก์ชันกลางสำหรับสร้างและส่ง request ไปยัง Bitkub API"""
+    """สร้างและส่งคำขอไปยัง Bitkub API"""
     API_KEY, _ = get_api_credentials()
-    ts = str(int(time.time() * 1000))
+    ts = str(int(time.time() * 1000))  # สร้าง timestamp ในหน่วยมิลลิวินาที
     
+    # สร้าง payload และ signature สำหรับคำขอ
     body_str = json.dumps(body) if body else ''
     payload = f"{ts}{method.upper()}{endpoint}{body_str}"
     sig = gen_sign(api_secret, payload)
@@ -101,6 +121,7 @@ def make_request(api_secret, endpoint, method='POST', body=None):
         'X-BTK-APIKEY': API_KEY
     }
     try:
+        # ส่งคำขอไปยัง API และจัดการข้อผิดพลาด
         response = requests.request(method, f'{API_HOST}{endpoint}', headers=headers, data=body_str)
         response.raise_for_status()
         data = response.json()
@@ -111,11 +132,13 @@ def make_request(api_secret, endpoint, method='POST', body=None):
         raise Exception(f"Request failed: {e}")
 
 def get_balances(api_secret, coins):
-    """ดึงยอดคงเหลือจาก Bitkub"""
+    """ดึงยอดคงเหลือของเหรียญทั้งหมดจาก Bitkub"""
+    # สร้างพอร์ตเริ่มต้นด้วย THB และเหรียญอื่นๆ
     portfolio = {'THB': 0.0}
     for coin in coins:
         portfolio[coin] = 0.0
     
+    # ดึงข้อมูลยอดคงเหลือจาก API
     data = make_request(api_secret, '/api/v3/market/balances')
     balances = data.get('result', {})
     portfolio['THB'] = balances.get('THB', {}).get('available', 0.0)
@@ -124,18 +147,19 @@ def get_balances(api_secret, coins):
     return portfolio
 
 def fetch_current_prices(pairs):
-    """ดึงราคาล่าสุดจาก Bitkub. API format is COIN_THB."""
+    """ดึงราคาล่าสุดของคู่เหรียญจาก Bitkub"""
     prices = {}
     try:
+        # ส่งคำขอเพื่อดึงราคาตลาด
         response = requests.get(f'{API_HOST}/api/v3/market/ticker')
         response.raise_for_status()
-        # The API returns a list of dicts. Convert it to a dict keyed by symbol for efficient lookup.
+        # แปลงข้อมูล API เป็น dictionary เพื่อการค้นหาที่รวดเร็ว
         api_data = {item['symbol']: item for item in response.json()}
 
-        for pair in pairs: # pair is in THB_COIN format, e.g., 'THB_XRP'
-            # Convert internal format to API format for lookup
+        for pair in pairs: # pair เป็นรูปแบบ THB_COIN เช่น 'THB_XRP'
+            # แปลงรูปแบบภายในเป็นรูปแบบ API (COIN_THB)
             coin = pair.split('_')[1]
-            ticker_symbol = f"{coin}_THB" # e.g., 'XRP_THB'
+            ticker_symbol = f"{coin}_THB" # เช่น 'XRP_THB'
             
             if ticker_symbol in api_data:
                 prices[pair] = float(api_data[ticker_symbol]['last'])
@@ -149,24 +173,24 @@ def fetch_current_prices(pairs):
     return prices
 
 def place_order(api_secret, symbol, action, amount):
-    """ส่งคำสั่งซื้อ/ขาย (Market Order). Symbol must be in COIN_THB format. Amount must be a float.
-    The amount will be formatted to string with no trailing zeros before sending to API.
-    """
+    """ส่งคำสั่งซื้อหรือขายแบบ Market Order"""
+    # เลือก endpoint ตามประเภทคำสั่ง (ซื้อ/ขาย)
     endpoint = '/api/v3/market/place-bid' if action == 'buy' else '/api/v3/market/place-ask'
 
-    # Format amount to string with no trailing zeros
-    req_body = {'sym': symbol, 'amt': round(amount, 2), 'rat': 0,'typ': 'market'}
+    # จัดรูปแบบจำนวนเงิน (สำหรับซื้อเป็น THB, สำหรับขายเป็นจำนวนเหรียญ)
+    req_body = {'sym': symbol, 'amt': round(amount, 2), 'rat': 0, 'typ': 'market'}
     data = make_request(api_secret, endpoint, method='POST', body=req_body)
     return data.get('result', {})
 
 # --- Portfolio & Display ---
 
 def calculate_portfolio_value(portfolio, prices):
-    """คำนวณมูลค่าพอร์ตรวม"""
-    total_value = portfolio.get('THB', 0.0)
+    """คำนวณมูลค่ารวมของพอร์ตโฟลิโอ"""
+    total_value = portfolio.get('THB', 0.0)  # เริ่มต้นด้วยยอด THB
     for currency, amount in portfolio.items():
         if currency != 'THB':
-            price = prices.get(f'THB_{currency}', 0) # CORRECT: Use internal format
+            # คำนวณมูลค่าเหรียญอื่นๆ โดยใช้ราคาล่าสุด
+            price = prices.get(f'THB_{currency}', 0)
             total_value += amount * price
     return total_value
 
@@ -182,10 +206,11 @@ def display_portfolio(timestamp, total_value, current_allocations, portfolio, pr
 
     for asset, target in target_allocations.items():
         amount = portfolio.get(asset, 0.0)
-        price = prices.get(f'THB_{asset}') if asset != 'THB' else 1 # CORRECT: Use internal format
+        price = prices.get(f'THB_{asset}') if asset != 'THB' else 1
         value = amount * price if price is not None else 0
         allocation = current_allocations.get(asset, 0.0)
 
+        # แสดงสัดส่วนที่ไม่ตรงเป้าหมายเป็นสีแดง
         allocation_text = f"{allocation:.2%}"
         if abs(allocation - target) > THRESHOLD:
             allocation_text = f"[bold red]{allocation_text}[/bold red]"
@@ -228,46 +253,56 @@ def display_transactions(transactions):
 # --- Main Rebalance Logic ---
 
 def rebalance():
-    """ฟังก์ชัน Rebalance ซื้อ/ขายจริง"""
+    """ฟังก์ชันหลักสำหรับการปรับสมดุลพอร์ตโฟลิโอ"""
     console.print(Panel("🚀 Starting Rebalance Bot", style="bold green"))
     
     _, api_secret = get_api_credentials()
     PAIRS, TARGET_ALLOCATIONS = load_config()
-    coins = [p.split('_')[1] for p in PAIRS]
+    coins = [p.split('_')[1] for p in PAIRS]  # ดึงรายการเหรียญจากคู่เหรียญ
     
-    # 1. Get Initial State
+    # 1. ตรวจสอบสถานะ API
+    console.print("Checking API status...")
+    api_status = check_api_status()
+    if api_status and any(s['status'] != 'ok' for s in api_status):
+        console.print(f"[red]❗ API status not OK: {api_status}[/red]")
+        return
+
+    # 2. ดึงสถานะพอร์ตเริ่มต้น
     console.print("Fetching initial portfolio state...")
     portfolio = get_balances(api_secret, coins + ['THB'])
+    console.print(f"[yellow]Available THB: {format_number(portfolio['THB'])} THB[/yellow]")  # แสดงยอด THB
     initial_prices = fetch_current_prices(PAIRS)
     if not initial_prices or all(v == 0 for v in initial_prices.values()):
         raise Exception("Could not fetch any valid prices from API. Aborting.")
     initial_value = calculate_portfolio_value(portfolio, initial_prices)
     console.print(f"[green]Initial portfolio value: {format_number(initial_value)} THB[/green]")
 
-    # 2. Setup Buy-and-Hold for comparison
+    # 3. ตั้งค่าพอร์ต Buy-and-Hold เพื่อเปรียบเทียบ
     buy_hold_portfolio = portfolio.copy()
 
-    # 3. Start Rebalance Check
+    # 4. เริ่มการตรวจสอบการปรับสมดุล
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     prices = fetch_current_prices(PAIRS)
     if not prices or all(v == 0 for v in prices.values()):
         raise Exception("Could not fetch current prices for rebalancing. Aborting.")
 
     total_value = calculate_portfolio_value(portfolio, prices)
+    # คำนวณสัดส่วนปัจจุบันของแต่ละเหรียญ
     current_allocations = {c: (portfolio.get(c, 0) * prices.get(f'THB_{c}', 0)) / total_value if total_value > 0 else 0 for c in TARGET_ALLOCATIONS}
     current_allocations['THB'] = portfolio['THB'] / total_value if total_value > 0 else 0
 
     display_portfolio(timestamp, total_value, current_allocations, portfolio, prices, TARGET_ALLOCATIONS)
 
     transactions = []
-    # 4. Execute Trades if needed
+    # 5. ดำเนินการซื้อขายถ้าจำเป็น
     for currency, target in TARGET_ALLOCATIONS.items():
         if currency == 'THB': continue
 
         current_alloc = current_allocations.get(currency, 0.0)
+        # ตรวจสอบว่าสัดส่วนปัจจุบันแตกต่างจากเป้าหมายเกิน THRESHOLD หรือไม่
         if abs(current_alloc - target) > THRESHOLD:
-            internal_pair = f'THB_{currency}' # Internal format for price lookup
-            api_symbol = f'{currency}_THB'.lower()   # API format for placing orders, must be lowercase
+            internal_pair = f'THB_{currency}' # รูปแบบภายในสำหรับค้นหาค่าราคา
+            api_symbol = f'{currency}_THB'.lower()   # รูปแบบ API สำหรับส่งคำสั่งซื้อขาย
 
             price = prices.get(internal_pair, 0)
             if price == 0: 
@@ -281,12 +316,18 @@ def rebalance():
             action = 'buy' if diff_value > 0 else 'sell'
 
             try:
+                order = None  # กำหนดค่าเริ่มต้นให้ order
                 if action == 'buy':
                     amount_in_thb = diff_value
                     if amount_in_thb < MIN_TRADE_AMOUNT: continue
-                    # Format amount to 2 decimal places for THB
+                    # ตรวจสอบยอดเงินก่อนซื้อ
+                    required_amount = amount_in_thb + (amount_in_thb * FEE_RATE)
+                    if required_amount > portfolio['THB']:
+                        console.print(f"[red]❗ Insufficient THB balance for {currency} buy order: Need {format_number(required_amount)} THB, Available {format_number(portfolio['THB'])} THB[/red]")
+                        continue
+                    # จัดรูปแบบจำนวนเงินสำหรับซื้อ (THB)
                     formatted_amount = round(amount_in_thb, 2)
-                    console.print(f"Attempting to [green]BUY[/green] {formatted_amount} THB of {currency} using symbol {api_symbol}")
+                    console.print(f"Attempting to [green]BUY[/green] {format_number(formatted_amount)} THB of {currency} using symbol {api_symbol}")
                     order = place_order(api_secret, api_symbol, 'buy', formatted_amount)
                     actual_amount_crypto = order.get('amt', 0)
                     actual_fee = order.get('fee', 0)
@@ -297,9 +338,9 @@ def rebalance():
                     amount_to_sell_crypto = abs(diff_value) / price
                     value_in_thb = amount_to_sell_crypto * price
                     if value_in_thb < MIN_TRADE_AMOUNT: continue
-                    # Format amount to 8 decimal places for crypto
+                    # จัดรูปแบบจำนวนเหรียญสำหรับขาย
                     formatted_amount = round(amount_to_sell_crypto, 8)
-                    console.print(f"Attempting to [red]SELL[/red] {formatted_amount} {currency} using symbol {api_symbol}")
+                    console.print(f"Attempting to [red]SELL[/red] {format_number(formatted_amount)} {currency} using symbol {api_symbol}")
                     order = place_order(api_secret, api_symbol, 'sell', formatted_amount)
                     actual_fee = order.get('fee', 0)
                     log_transaction(timestamp, currency, 'Sell', formatted_amount, price, actual_fee, total_value)
@@ -307,8 +348,9 @@ def rebalance():
 
             except Exception as e:
                 console.print(f"[red]❗ Error executing {action} order for {currency}: {e}[/red]")
+                console.print(f"[yellow]API Response: {order if order is not None else 'No order response'}[/yellow]") # type: ignore
 
-    # 5. Display Results
+    # 6. แสดงผลลัพธ์
     display_transactions(transactions)
 
     console.print("\nFetching final portfolio state...")
@@ -320,12 +362,14 @@ def rebalance():
     total_fees = sum(t['fee'] for t in transactions)
     withdrawal_fee = calculate_withdrawal_fee(final_portfolio.get('THB', 0), BANK) or 0
 
+    # คำนวณกำไรและ ROI
     net_value = final_value - withdrawal_fee
     profit = net_value - initial_value
     roi = (profit / initial_value) * 100 if initial_value > 0 else 0
     buy_hold_profit = buy_hold_final - initial_value
     buy_hold_roi = (buy_hold_profit / initial_value) * 100 if initial_value > 0 else 0
 
+    # สร้างตารางสรุปผลการปรับสมดุล
     summary_table = Table(title="📊 Rebalance Summary", show_header=True, header_style="bold cyan")
     summary_table.add_column("Metric", style="magenta")
     summary_table.add_column("Value", style="green")
@@ -344,6 +388,7 @@ def rebalance():
     console.print(Panel(summary_table, title="✅ Rebalance Complete", border_style="green"))
 
 def main():
+    """ฟังก์ชันหลักสำหรับเรียกใช้งานการปรับสมดุล"""
     try:
         rebalance()
     except Exception as e:
