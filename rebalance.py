@@ -26,11 +26,12 @@ SAVE_TO_SHEET = True
 SHEET_NAME = "Bitkub Liquidity Data"
 PORTFOLIO_WORKSHEET_NAME = "Portfolio"
 SUMMARY_WORKSHEET_NAME = "Rebalance"
+TRANSACTION_WORKSHEET_NAME = "Transaction" # เพิ่ม Worksheet สำหรับ Transaction
 CREDENTIALS_FILE = "credentials.json"
 
 console = Console()
 
-# --- Core Functions (Unchanged) ---
+# --- Core Functions ---
 def get_api_credentials():
     load_dotenv()
     api_key = os.environ.get('BITKUB_API_KEY')
@@ -45,6 +46,7 @@ def format_number(number, decimals=2):
     return f"{number:,.{decimals}f}"
 
 def log_transaction(timestamp, currency, action, amount, price, fee, portfolio_value):
+    # This function now only logs to CSV. Google Sheet logging is handled separately.
     file_exists = os.path.exists('trade_log.csv')
     with open('trade_log.csv', 'a', newline='') as f:
         writer = csv.writer(f)
@@ -73,12 +75,16 @@ def load_config():
 
 # --- Google Sheet Functions ---
 def get_gspread_client():
-    if not os.path.exists(CREDENTIALS_FILE): return None
+    if not os.path.exists(CREDENTIALS_FILE):
+        console.print(f"[bold red]Credentials file not found: '{CREDENTIALS_FILE}'[/bold red]")
+        return None
     try:
         scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope) # type: ignore
         return gspread.authorize(creds) # type: ignore
-    except Exception: return None
+    except Exception as e:
+        console.print(f"[bold red]Failed to authorize Google Sheets: {e}[/bold red]")
+        return None
 
 def save_data_to_worksheet(client, data, worksheet_name):
     try:
@@ -90,13 +96,11 @@ def save_data_to_worksheet(client, data, worksheet_name):
         
         console.print(f"[yellow]Saving data to worksheet: '{worksheet_name}'...[/yellow]")
         if isinstance(data, pd.DataFrame):
-            # Data is already formatted strings
             if not worksheet.get_all_records():
                 worksheet.append_rows([data.columns.tolist()] + data.values.tolist(), value_input_option='USER_ENTERED')
             else:
                 worksheet.append_rows(data.values.tolist(), value_input_option='USER_ENTERED')
         else: # Dictionary
-            # Data is already formatted strings
             if not worksheet.get_all_records():
                 worksheet.append_row(list(data.keys()), value_input_option='USER_ENTERED')
             worksheet.append_row(list(data.values()), value_input_option='USER_ENTERED')
@@ -104,7 +108,7 @@ def save_data_to_worksheet(client, data, worksheet_name):
     except Exception as e:
         console.print(f"[bold red]Error saving to '{worksheet_name}': {e}[/bold red]")
 
-# --- Bitkub API (Unchanged) ---
+# --- Bitkub API ---
 def check_api_status():
     try:
         r = requests.get(f'{API_HOST}/api/status'); r.raise_for_status(); return r.json()
@@ -170,15 +174,39 @@ def display_portfolio(df, total_value):
         portfolio_table.add_column(col, style="yellow" if col == "Target" else "green")
 
     for _, row in df.iterrows():
-        # Create a list of row values, excluding the timestamp
         row_values = [str(row[col]) for col in df.columns if col != "Timestamp"]
-        # Apply red style if allocation is off
         raw_alloc = float(row['Allocation'].strip('%')) / 100
         raw_target = float(row['Target'].strip('%')) / 100
         if abs(raw_alloc - raw_target) > THRESHOLD:
-            row_values[4] = f"[bold red]{row['Allocation']}[/bold red]" # Allocation is the 5th column (index 4)
+            row_values[4] = f"[bold red]{row['Allocation']}[/bold red]"
         portfolio_table.add_row(*row_values)
     console.print(Panel(portfolio_table, title=f"💰 Current Portfolio Value: {format_number(total_value)} THB", border_style="blue"))
+
+def create_formatted_transactions_df(transactions_raw_list):
+    records = []
+    for t in transactions_raw_list:
+        records.append({
+            "Timestamp": t['timestamp'],
+            "Currency": t['currency'],
+            "Action": t['action'],
+            "Amount": format_number(t['amount'], 8),
+            "Price (THB)": format_number(t['price']),
+            "Fee (THB)": format_number(t['fee'], 4),
+            "Portfolio Value (THB)": format_number(t['portfolio_value'])
+        })
+    return pd.DataFrame(records)
+
+def display_transactions(df):
+    if df.empty: return
+    transaction_table = Table(title="📈 Transactions Executed", show_header=True, header_style="bold cyan")
+    for col in df.columns:
+        transaction_table.add_column(col)
+    for _, row in df.iterrows():
+        action_style = "green" if row['Action'] == 'Buy' else "red"
+        row_values = list(row.values)
+        row_values[2] = f"[{action_style}]{row_values[2]}[/{action_style}]" # Apply style to Action column
+        transaction_table.add_row(*row_values)
+    console.print(transaction_table)
 
 def create_formatted_summary_dict(timestamp, initial_value, final_value, buy_hold_value, fees):
     profit = final_value - initial_value
@@ -236,14 +264,39 @@ def rebalance():
         save_data_to_worksheet(gspread_client, formatted_portfolio_df, PORTFOLIO_WORKSHEET_NAME)
 
     # --- 2. Execute Transactions ---
-    transactions = []
+    transactions_raw = [] # เก็บข้อมูลดิบของ transactions
     # ... (Transaction logic would go here, for now it's empty)
+    # ตัวอย่างการเพิ่ม transaction (สมมติว่ามีการซื้อขายเกิดขึ้น)
+    # transactions_raw.append({
+    #     'timestamp': timestamp,
+    #     'currency': 'BTC',
+    #     'action': 'Buy',
+    #     'amount': 0.001,
+    #     'price': 1000000,
+    #     'fee': 2.5,
+    #     'portfolio_value': initial_value + 1000
+    # })
+    # transactions_raw.append({
+    #     'timestamp': timestamp,
+    #     'currency': 'ETH',
+    #     'action': 'Sell',
+    #     'amount': 0.01,
+    #     'price': 70000,
+    #     'fee': 1.75,
+    #     'portfolio_value': initial_value - 500
+    # })
 
-    # --- 3. Format, Display, and Save Summary ---
+    # --- 3. Format, Display, and Save Transactions ---
+    formatted_transactions_df = create_formatted_transactions_df(transactions_raw)
+    display_transactions(formatted_transactions_df)
+    if gspread_client:
+        save_data_to_worksheet(gspread_client, formatted_transactions_df, TRANSACTION_WORKSHEET_NAME)
+
+    # --- 4. Format, Display, and Save Summary ---
     # For this example, we assume no trades, so final_value = initial_value
     final_value = calculate_portfolio_value(portfolio, prices)
     buy_hold_value = final_value # Same for this example
-    total_fees = sum(t.get('fee', 0) for t in transactions)
+    total_fees = sum(t.get('fee', 0) for t in transactions_raw) # ใช้ transactions_raw
 
     formatted_summary = create_formatted_summary_dict(timestamp, initial_value, final_value, buy_hold_value, total_fees)
     display_summary(formatted_summary)
