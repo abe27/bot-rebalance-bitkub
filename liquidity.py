@@ -24,8 +24,8 @@ def get_gspread_client():
         return None
     try:
         scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        return gspread.authorize(creds)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope) # type: ignore
+        return gspread.authorize(creds) # type: ignore
     except Exception as e:
         console.print(f"[bold red]Failed to authorize Google Sheets: {e}[/bold red]")
         return None
