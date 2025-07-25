@@ -53,7 +53,7 @@ graph TD
 ### 1. Clone Repository
 
 ```bash
-git clone git@github.com:abe27/bot-rebalance-bitkub.git
+git clone git@github.com:abe27/bot-rebalance-bitkub.git pybot
 cd pybot
 ```
 
