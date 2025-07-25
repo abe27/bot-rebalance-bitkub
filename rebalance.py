@@ -16,17 +16,18 @@ import pandas as pd
 
 # --- การตั้งค่าหลัก ---
 API_HOST = 'https://api.bitkub.com'
-MIN_TRADE_AMOUNT = 50
+MIN_TRADE_AMOUNT = 50  # ลดจาก 50 เพื่อให้เหมาะกับ THB 500
 FEE_RATE = 0.0025
 BANK = 'KBank'
-THRESHOLD = 0.05
+THRESHOLD = 0.01  # ลดจาก 0.05 เพื่อให้ซื้อขายเกิดง่ายขึ้น
+DRY_RUN = False  # เปลี่ยนเป็น False เพื่อให้ซื้อขายจริง
 
 # --- การตั้งค่า Google Sheet ---
 SAVE_TO_SHEET = True
 SHEET_NAME = "Bitkub Liquidity Data"
 PORTFOLIO_WORKSHEET_NAME = "Portfolio"
 SUMMARY_WORKSHEET_NAME = "Rebalance"
-TRANSACTION_WORKSHEET_NAME = "Transaction" # เพิ่ม Worksheet สำหรับ Transaction
+TRANSACTION_WORKSHEET_NAME = "Transaction"
 CREDENTIALS_FILE = "credentials.json"
 
 console = Console()
@@ -46,7 +47,6 @@ def format_number(number, decimals=2):
     return f"{number:,.{decimals}f}"
 
 def log_transaction(timestamp, currency, action, amount, price, fee, portfolio_value):
-    # This function now only logs to CSV. Google Sheet logging is handled separately.
     file_exists = os.path.exists('trade_log.csv')
     with open('trade_log.csv', 'a', newline='') as f:
         writer = csv.writer(f)
@@ -59,7 +59,7 @@ def calculate_withdrawal_fee(amount, bank):
     if amount <= 100000: return 20.0
     if amount <= 500000: return 75.0
     if amount <= 2000000: return 200.0
-    return None
+    return 300.0  # เพิ่มสำหรับกรณีเกิน 2,000,000
 
 def load_config():
     try:
@@ -80,8 +80,8 @@ def get_gspread_client():
         return None
     try:
         scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope) # type: ignore
-        return gspread.authorize(creds) # type: ignore
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+        return gspread.authorize(creds)
     except Exception as e:
         console.print(f"[bold red]Failed to authorize Google Sheets: {e}[/bold red]")
         return None
@@ -100,7 +100,7 @@ def save_data_to_worksheet(client, data, worksheet_name):
                 worksheet.append_rows([data.columns.tolist()] + data.values.tolist(), value_input_option='USER_ENTERED')
             else:
                 worksheet.append_rows(data.values.tolist(), value_input_option='USER_ENTERED')
-        else: # Dictionary
+        else:
             if not worksheet.get_all_records():
                 worksheet.append_row(list(data.keys()), value_input_option='USER_ENTERED')
             worksheet.append_row(list(data.values()), value_input_option='USER_ENTERED')
@@ -111,40 +111,68 @@ def save_data_to_worksheet(client, data, worksheet_name):
 # --- Bitkub API ---
 def check_api_status():
     try:
-        r = requests.get(f'{API_HOST}/api/status'); r.raise_for_status(); return r.json()
-    except Exception: return None
+        r = requests.get(f'{API_HOST}/api/status', timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        console.print(f"[bold red]API status check failed: {e}[/bold red]")
+        return None
 
 def make_request(api_secret, endpoint, method='POST', body=None):
     API_KEY, _ = get_api_credentials()
-    ts = str(int(time.time() * 1000)); body_str = json.dumps(body or {})
-    payload = f"{ts}{method.upper()}{endpoint}{body_str}"
+    ts = str(int(time.time() * 1000))
+    
+    # Correctly create the signature payload
+    sig_body = json.dumps(body) if body else ''
+    payload = f"{ts}{method.upper()}{endpoint}{sig_body}"
     sig = gen_sign(api_secret, payload)
+
+    # The actual request body for POST requests
+    req_data = json.dumps(body) if body else None
+
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'X-BTK-TIMESTAMP': ts, 'X-BTK-SIGN': sig, 'X-BTK-APIKEY': API_KEY}
-    r = requests.request(method, f'{API_HOST}{endpoint}', headers=headers, data=body_str); r.raise_for_status()
-    data = r.json()
-    if data.get('error') != 0: raise Exception(f"API Error {data.get('error')}")
-    return data
+    try:
+        r = requests.request(method, f'{API_HOST}{endpoint}', headers=headers, data=req_data, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get('error') != 0: raise Exception(f"API Error {data.get('error')}")
+        return data
+    except Exception as e:
+        console.print(f"[bold red]API request failed: {e}[/bold red]")
+        raise
 
 def get_balances(api_secret, coins):
-    portfolio = {'THB': 0.0, **{c: 0.0 for c in coins}}
-    balances = make_request(api_secret, '/api/v3/market/balances').get('result', {})
-    for asset, values in balances.items():
-        if asset in portfolio: portfolio[asset] = values.get('available', 0.0)
-    return portfolio
+    try:
+        all_assets = coins + ['THB']
+        portfolio = {asset: 0.0 for asset in all_assets}
+        balances_data = make_request(api_secret, '/api/v3/market/balances').get('result', {})
+        for asset, values in balances_data.items():
+            if asset in portfolio:
+                portfolio[asset] = float(values.get('available', 0.0))
+        console.print(f"[green]Successfully fetched balances: {portfolio}[/green]")
+        return portfolio
+    except Exception as e:
+        console.print(f"[bold red]Error fetching balances: {e}. Exiting.[/bold red]")
+        raise
 
 def fetch_current_prices(pairs):
     try:
-        r = requests.get(f'{API_HOST}/api/v3/market/ticker'); r.raise_for_status()
+        r = requests.get(f'{API_HOST}/api/v3/market/ticker', timeout=10)
+        r.raise_for_status()
         api_data = {item['symbol']: item for item in r.json()}
-        return {pair: float(api_data[f"{pair.split('_')[1]}_THB"]['last']) for pair in pairs}
-    except Exception: return {pair: 0 for pair in pairs}
+        prices = {pair: float(api_data[f"{pair.split('_')[1]}_THB"]['last']) for pair in pairs}
+        console.print(f"[cyan]Fetched prices: {prices}[/cyan]")
+        if not any(prices.values()): raise Exception("All prices are zero.")
+        return prices
+    except Exception as e:
+        console.print(f"[bold red]Error fetching prices: {e}[/bold red]")
+        return {pair: 0 for pair in pairs}
 
 def place_order(api_secret, symbol, action, amount):
     endpoint = '/api/v3/market/place-bid' if action == 'buy' else '/api/v3/market/place-ask'
-    return make_request(api_secret, endpoint, 'POST', {'sym': symbol, 'amt': amount, 'rat': 0, 'typ': 'market'}).get('result', {})
+    return make_request(api_secret, endpoint, 'POST', {'sym': str(symbol).lower(), 'amt': amount, 'rat': 0, 'typ': 'market'}).get('result', {})
 
 # --- Data Formatting and Display ---
-
 def calculate_portfolio_value(portfolio, prices):
     return portfolio.get('THB', 0.0) + sum(amount * prices.get(f'THB_{currency}', 0) for currency, amount in portfolio.items() if currency != 'THB')
 
@@ -172,7 +200,6 @@ def display_portfolio(df, total_value):
     for col in df.columns:
         if col == "Timestamp": continue
         portfolio_table.add_column(col, style="yellow" if col == "Target" else "green")
-
     for _, row in df.iterrows():
         row_values = [str(row[col]) for col in df.columns if col != "Timestamp"]
         raw_alloc = float(row['Allocation'].strip('%')) / 100
@@ -197,14 +224,16 @@ def create_formatted_transactions_df(transactions_raw_list):
     return pd.DataFrame(records)
 
 def display_transactions(df):
-    if df.empty: return
+    if df.empty: 
+        console.print("[yellow]No transactions executed.[/yellow]")
+        return
     transaction_table = Table(title="📈 Transactions Executed", show_header=True, header_style="bold cyan")
     for col in df.columns:
         transaction_table.add_column(col)
     for _, row in df.iterrows():
         action_style = "green" if row['Action'] == 'Buy' else "red"
         row_values = list(row.values)
-        row_values[2] = f"[{action_style}]{row_values[2]}[/{action_style}]" # Apply style to Action column
+        row_values[2] = f"[{action_style}]{row_values[2]}[/{action_style}]"
         transaction_table.add_row(*row_values)
     console.print(transaction_table)
 
@@ -238,7 +267,6 @@ def display_summary(summary_data):
     console.print(Panel(summary_table, title="✅ Rebalance Complete", border_style="green"))
 
 # --- Main Rebalance Logic ---
-
 def rebalance():
     console.print(Panel("🚀 Starting Rebalance Bot", style="bold green"))
     gspread_client = get_gspread_client() if SAVE_TO_SHEET else None
@@ -246,12 +274,16 @@ def rebalance():
     PAIRS, TARGET_ALLOCATIONS = load_config()
     coins = [p.split('_')[1] for p in PAIRS]
     
-    if check_api_status() is None: return
+    if check_api_status() is None:
+        console.print("[bold red]API is down, exiting...[/bold red]")
+        return
 
     console.print("Fetching initial portfolio state...")
     portfolio = get_balances(api_secret, coins)
     prices = fetch_current_prices(PAIRS)
-    if not any(prices.values()): raise Exception("Could not fetch prices.")
+    if not any(prices.values()):
+        console.print("[bold red]Could not fetch prices, exiting...[/bold red]")
+        return
     
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     initial_value = calculate_portfolio_value(portfolio, prices)
@@ -264,27 +296,75 @@ def rebalance():
         save_data_to_worksheet(gspread_client, formatted_portfolio_df, PORTFOLIO_WORKSHEET_NAME)
 
     # --- 2. Execute Transactions ---
-    transactions_raw = [] # เก็บข้อมูลดิบของ transactions
-    # ... (Transaction logic would go here, for now it's empty)
-    # ตัวอย่างการเพิ่ม transaction (สมมติว่ามีการซื้อขายเกิดขึ้น)
-    # transactions_raw.append({
-    #     'timestamp': timestamp,
-    #     'currency': 'BTC',
-    #     'action': 'Buy',
-    #     'amount': 0.001,
-    #     'price': 1000000,
-    #     'fee': 2.5,
-    #     'portfolio_value': initial_value + 1000
-    # })
-    # transactions_raw.append({
-    #     'timestamp': timestamp,
-    #     'currency': 'ETH',
-    #     'action': 'Sell',
-    #     'amount': 0.01,
-    #     'price': 70000,
-    #     'fee': 1.75,
-    #     'portfolio_value': initial_value - 500
-    # })
+    transactions_raw = []
+    total_fees = 0.0
+    console.print("[yellow]Calculating rebalance trades...[/yellow]")
+    target_values = {asset: TARGET_ALLOCATIONS[asset] * initial_value for asset in TARGET_ALLOCATIONS}
+    available_thb = portfolio['THB']
+    console.print(f"[cyan]Available THB: {format_number(available_thb)}[/cyan]")
+    console.print(f"[cyan]Prices: {prices}[/cyan]")
+    console.print(f"[cyan]Current Allocations: {current_allocations}[/cyan]")
+    console.print(f"[cyan]Target Allocations: {TARGET_ALLOCATIONS}[/cyan]")
+
+    for asset in TARGET_ALLOCATIONS:
+        if asset == 'THB': continue
+        api_symbol = f'{asset}_THB'
+        symbol = f'THB_{asset}'
+        current_value = portfolio.get(asset, 0) * prices.get(symbol, 0)
+        target_value = target_values[asset]
+        diff_value = target_value - current_value
+        console.print(f"[cyan]Asset: {asset}, Current: {format_number(current_value)}, Target: {format_number(target_value)}, Diff: {format_number(diff_value)} ({format_number(abs(diff_value)/initial_value*100, 2)}%)[/cyan]")
+
+        if abs(diff_value) / initial_value > THRESHOLD:
+            amount_thb = min(abs(diff_value), available_thb / (1 + FEE_RATE))
+            if amount_thb < MIN_TRADE_AMOUNT:
+                console.print(f"[yellow]Skipping {asset}: Trade amount {format_number(amount_thb)} THB is below minimum {MIN_TRADE_AMOUNT} THB[/yellow]")
+                continue
+
+            amount_coin = amount_thb / prices[symbol] if prices[symbol] > 0 else 0
+            action = 'buy' if diff_value > 0 else 'sell'
+            fee = amount_thb * FEE_RATE
+            total_fees += fee
+
+            if action == 'buy' and available_thb < (amount_thb + fee):
+                console.print(f"[bold red]Insufficient THB balance for {asset}: Need {format_number(amount_thb + fee)} THB, Available {format_number(available_thb)} THB[/bold red]")
+                continue
+
+            try:
+                console.print(f"[yellow]Executing {action} order for {asset}: {format_number(amount_coin, 8)} at {format_number(prices[symbol])} THB, Fee: {format_number(fee)} THB[/yellow]")
+                if DRY_RUN:
+                    console.print(f"[yellow]DRY RUN: Would execute {action} order for {asset}[/yellow]")
+                else:
+                    result = place_order(api_secret, api_symbol, action, amount_thb if action == 'buy' else amount_coin)
+                    console.print(f"[green]Successfully executed {action} order for {asset}: {format_number(amount_coin, 8)} at {format_number(prices[symbol])} THB[/green]")
+
+                # อัพเดท portfolio
+                if action == 'buy':
+                    portfolio[asset] = portfolio.get(asset, 0) + amount_coin
+                    portfolio['THB'] -= (amount_thb + fee)
+                    available_thb -= (amount_thb + fee)
+                else:
+                    portfolio[asset] = portfolio.get(asset, 0) - amount_coin
+                    portfolio['THB'] += (amount_thb - fee)
+                    available_thb += (amount_thb - fee)
+
+                # บันทึก transaction
+                transactions_raw.append({
+                    'timestamp': timestamp,
+                    'currency': asset,
+                    'action': action.capitalize(),
+                    'amount': amount_coin,
+                    'price': prices[symbol],
+                    'fee': fee,
+                    'portfolio_value': calculate_portfolio_value(portfolio, prices)
+                })
+                log_transaction(timestamp, asset, action.capitalize(), amount_coin, prices[symbol], fee, transactions_raw[-1]['portfolio_value'])
+
+                time.sleep(1)  # หน่วงเวลาเพื่อป้องกัน Rate Limit
+            except Exception as e:
+                console.print(f"[bold red]Failed to execute {action} order for {asset}: {e}[/bold red]")
+        else:
+            console.print(f"[yellow]Skipping {asset}: Difference {format_number(abs(diff_value)/initial_value*100, 2)}% is below threshold {THRESHOLD*100}%[/yellow]")
 
     # --- 3. Format, Display, and Save Transactions ---
     formatted_transactions_df = create_formatted_transactions_df(transactions_raw)
@@ -293,19 +373,18 @@ def rebalance():
         save_data_to_worksheet(gspread_client, formatted_transactions_df, TRANSACTION_WORKSHEET_NAME)
 
     # --- 4. Format, Display, and Save Summary ---
-    # For this example, we assume no trades, so final_value = initial_value
     final_value = calculate_portfolio_value(portfolio, prices)
-    buy_hold_value = final_value # Same for this example
-    total_fees = sum(t.get('fee', 0) for t in transactions_raw) # ใช้ transactions_raw
-
+    buy_hold_value = calculate_portfolio_value(get_balances(api_secret, coins), prices)
     formatted_summary = create_formatted_summary_dict(timestamp, initial_value, final_value, buy_hold_value, total_fees)
     display_summary(formatted_summary)
     if gspread_client:
         save_data_to_worksheet(gspread_client, formatted_summary, SUMMARY_WORKSHEET_NAME)
 
 def main():
-    try: rebalance()
-    except Exception as e: console.print(f"[bold red]❗ An error occurred: {e}[/bold red]")
+    try:
+        rebalance()
+    except Exception as e:
+        console.print(f"[bold red]❗ An error occurred: {e}[/bold red]")
 
 if __name__ == "__main__":
     main()
